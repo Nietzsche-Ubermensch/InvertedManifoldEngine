@@ -1,6 +1,8 @@
 # TopoNetX + InvertedManifoldEngine Entropy-GAT Integration
 # Bridge topological spectrum algorithms with true-alpha risk/entropy monitoring
 
+import numpy as np
+
 # Conceptual integration (install toponetx for full use):
 # pip install toponetx
 

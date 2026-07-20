@@ -4,20 +4,22 @@
 
 import os
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torch.autograd as autograd
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
 # ============ InvertedManifoldEngine (True-Alpha Corrected) ============
-class InvertedManifoldEngine:
+class InvertedManifoldEngine(nn.Module):
     def __init__(self, tau=0.01, lam=1.0, alpha_param=5.0, entropy_threshold=1.45):
         super().__init__()
         self.tau = tau
         self.lam = lam
         self.alpha_param = alpha_param
         self.entropy_threshold = entropy_threshold
-        self.risk_scores = torch.tensor([0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 1.0, 1.0])
+        self.register_buffer('risk_scores', torch.tensor([0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 1.0, 1.0]))
 
     def __call__(self, raw_scores, kv_bias_t, v_matrix, pi_ref=None, r=None, r_human=None, beta=0.1):
         return self.forward(raw_scores, kv_bias_t, v_matrix, pi_ref, r, r_human, beta)
@@ -101,11 +103,12 @@ class SimpleG(torch.nn.Module):
 class SimpleD(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc = torch.nn.Linear(3*32*32 + 10, 1)
+        self.fc = torch.nn.Linear(3*32*32 + 10, 1)          # critic (WGAN) head
+        self.fc_class = torch.nn.Linear(3*32*32 + 10, 10)   # ACGAN class logits head
     def forward(self, x, labels):
         x = x.view(x.size(0), -1)
         x = torch.cat([x, labels], dim=1)
-        return self.fc(x)
+        return self.fc(x), self.fc_class(x)
 
 G = SimpleG().to(device)
 D = SimpleD().to(device)
@@ -118,10 +121,31 @@ opt_d = torch.optim.Adam(D.parameters(), lr=1e-4, betas=(0.0, 0.9))
 opt_g = torch.optim.Adam(G.parameters(), lr=1e-4, betas=(0.0, 0.9))
 
 # ============ Losses ============
-# Placeholder losses (implement real WGANGPLoss and ACGANLoss as needed)
+# WGAN-GP gradient penalty with autograd.grad on interpolated samples
+def gradient_penalty(D, real_data, fake_data, real_labels, fake_labels, device, lambda_gp=10.0):
+    batch_size = real_data.size(0)
+    alpha = torch.rand(batch_size, 1, 1, 1, device=device)
+    # Interpolate between real and fake
+    interpolates = alpha * real_data + (1 - alpha) * fake_data
+    interpolates.requires_grad_(True)
+    # Use real labels for the interpolated samples (standard WGAN-GP + ACGAN approach)
+    interp_labels = real_labels
+    disc_interpolates, _ = D(interpolates, interp_labels)
+    grads = autograd.grad(
+        outputs=disc_interpolates,
+        inputs=interpolates,
+        grad_outputs=torch.ones_like(disc_interpolates),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    grads = grads.view(batch_size, -1)
+    gp = ((grads.norm(2, dim=1) - 1) ** 2).mean()
+    return gp
+
 class WGANGPLoss:
-    def __call__(self, real, fake, gp):
-        return -real.mean() + fake.mean() + 10 * gp
+    def __call__(self, real, fake, gp, lambda_gp=10.0):
+        return -real.mean() + fake.mean() + lambda_gp * gp
 
 class ACGANLoss:
     def __init__(self, alpha=5.0):
@@ -150,15 +174,19 @@ for epoch in range(num_epochs):
         # --- Train D ---
         opt_d.zero_grad()
         # real
-        real_out = D(images, F.one_hot(labels, 10).float())
+        real_out, real_cls = D(images, F.one_hot(labels, 10).float())
         # fake
         z = torch.randn(batch_size, 100, device=device)
         fake_labels = torch.randint(0, 10, (batch_size,), device=device)
         fake_images = G(z, F.one_hot(fake_labels, 10).float()).detach()
-        fake_out = D(fake_images, F.one_hot(fake_labels, 10).float())
-        # gp placeholder
-        gp = 0.0
-        d_loss = wgan_loss(real_out, fake_out, gp)
+        fake_out, fake_cls = D(fake_images, F.one_hot(fake_labels, 10).float())
+        # real WGAN-GP gradient penalty
+        gp = gradient_penalty(D, images, fake_images, F.one_hot(labels, 10).float(),
+                              F.one_hot(fake_labels, 10).float(), device)
+        d_wgan = wgan_loss(real_out, fake_out, gp)
+        # ACGAN loss for D (classify real and fake)
+        d_acgan = acgan_loss(real_cls, labels) + acgan_loss(fake_cls, fake_labels)
+        d_loss = d_wgan + 0.1 * d_acgan
         d_loss.backward()
         opt_d.step()
 
@@ -166,12 +194,12 @@ for epoch in range(num_epochs):
         opt_g.zero_grad()
         z = torch.randn(batch_size, 100, device=device)
         gen_labels = torch.randint(0, 10, (batch_size,), device=device)
-        fake_images = G(z, F.one_hot(gen_labels, 10).float())
-        fake_out = D(fake_images, F.one_hot(gen_labels, 10).float())
+        gen_labels_onehot = F.one_hot(gen_labels, 10).float()
+        fake_images = G(z, gen_labels_onehot)
+        fake_out, fake_cls = D(fake_images, gen_labels_onehot)
         g_wgan = -fake_out.mean()
-        # ACGAN for G
-        # (assume D has class head; here simplified)
-        g_acgan = torch.tensor(0.0, device=device)
+        # ACGAN for G: real cross_entropy loss using D's class logits head
+        g_acgan = acgan_loss(fake_cls, gen_labels)
         g_loss = g_wgan + 0.1 * g_acgan
         g_loss.backward()
         opt_g.step()
